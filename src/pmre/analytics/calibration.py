@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from pm_sessions import sessions_open_for
+
 from .ev import compute_ev
 from .stats import (
     benjamini_hochberg,
@@ -67,10 +69,15 @@ def _usable(o: SnapshotObs) -> bool:
 
 def _scopes_for(o: SnapshotObs) -> list[str]:
     scopes = ["total"]
-    if o.session_primary and o.session_primary != "off_session":
-        scopes.append(f"session:{o.session_primary}")
-    elif o.session_primary == "off_session":
+    if o.session_primary == "off_session":
         scopes.append("session:off_session")
+    else:
+        # Credit every session that was open — not only the priority-winning
+        # primary — so the London/NY overlap counts toward London (and the
+        # Tokyo/London overlap toward Tokyo), instead of being attributed solely
+        # to the higher-priority session. See pm_sessions.sessions_open_for.
+        for name in sorted(sessions_open_for(o.session_primary, o.session_overlap)):
+            scopes.append(f"session:{name}")
     if o.session_overlap:
         scopes.append(f"overlap:{o.session_overlap}")
     return scopes

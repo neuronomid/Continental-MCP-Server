@@ -10,8 +10,20 @@ from .calendars import CalendarProvider, default_provider
 
 # Bump when session hours / overlap rules change. Producers stamp this on every
 # snapshot; consumers must match or raise.
-SESSION_MODEL_VERSION = "sessions-v1"
+# v2: added the pacific (NY close→Tokyo open) and transitional (Tokyo close→London
+#     open) gap sessions so the clock is covered 24/7; off_session is now only a
+#     defensive fallback and is no longer emitted under the default configuration.
+SESSION_MODEL_VERSION = "sessions-v2"
 
+# The two dead windows between the three formal exchange sessions are named so the
+# clock is covered 24/7 with no ``off_session`` holes:
+#   pacific       — New York close → Tokyo open (US-Pacific / pre-Asia hours)
+#   transitional  — Tokyo close → London open (Asia→Europe handover)
+# They are *derived* from the formal sessions' boundaries (not fixed local hours),
+# so they track DST automatically. ``off_session`` is kept only as a defensive
+# fallback and does not occur under the current three-session configuration.
+PACIFIC = "pacific"
+TRANSITIONAL = "transitional"
 OFF_SESSION = "off_session"
 
 
@@ -87,6 +99,33 @@ def _is_open(sess: SessionDef, instant_utc: dt.datetime) -> tuple[bool, dt.date]
     return is_open, local.date()
 
 
+def _next_open_utc(sess: SessionDef, instant_utc: dt.datetime) -> dt.datetime:
+    """The session's next clock-open boundary strictly after ``instant_utc``."""
+    local = instant_utc.astimezone(sess.zoneinfo)
+    open_utc = instant_utc
+    for add in (0, 1, 2):
+        d = local.date() + dt.timedelta(days=add)
+        open_utc = dt.datetime.combine(d, sess.start, sess.zoneinfo).astimezone(dt.UTC)
+        if open_utc > instant_utc:
+            return open_utc
+    return open_utc  # pragma: no cover - a daily session always opens within 2 days
+
+
+# The session that opens *next* is the one whose opening ends the current dead
+# window, which uniquely identifies the gap: Pacific ends when Tokyo opens,
+# Transitional ends when London opens. No gap ever ends with New York opening
+# (NY opens while London is still open — that is the london_ny overlap, not a gap).
+_GAP_BEFORE_OPEN: dict[str, str] = {"tokyo": PACIFIC, "london": TRANSITIONAL}
+
+
+def _classify_gap(instant_utc: dt.datetime) -> str:
+    """Name the dead window between formal sessions (pacific/transitional)."""
+    next_to_open = min(
+        SESSIONS, key=lambda n: _next_open_utc(SESSIONS[n], instant_utc)
+    )
+    return _GAP_BEFORE_OPEN.get(next_to_open, OFF_SESSION)
+
+
 def label_instant(
     instant: dt.datetime, provider: CalendarProvider | None = None
 ) -> SessionLabel:
@@ -101,10 +140,15 @@ def label_instant(
             open_map[name] = local_date
 
     if not open_map:
+        # No formal exchange session is open → we are in a named gap. Gaps have no
+        # anchoring exchange, so integrity is weekend-aware on the UTC date only
+        # (keeps the regular/weekend split consistent with the formal sessions so
+        # weekend filtering does not silently leak gap data into the regular pool).
+        gap_integrity = "weekend" if instant_utc.weekday() >= 5 else "regular"
         return SessionLabel(
-            session_primary=OFF_SESSION,
+            session_primary=_classify_gap(instant_utc),
             session_overlap=None,
-            session_integrity="regular",
+            session_integrity=gap_integrity,
             open_sessions=(),
         )
 
@@ -125,6 +169,34 @@ def label_instant(
         session_integrity=integrity,
         open_sessions=tuple(sorted(open_map)),
     )
+
+
+def sessions_open_for(
+    session_primary: str | None, session_overlap: str | None
+) -> frozenset[str]:
+    """Recover every session that was open from a persisted ``(primary, overlap)`` stamp.
+
+    Snapshots store only ``session_primary`` + ``session_overlap`` (not the full
+    ``open_sessions`` tuple), because ``session_primary`` keeps only the
+    highest-priority session when several are open. But every simultaneously-open
+    pair is a *named* overlap, so the primary and the overlap label together
+    recover the complete open-session set.
+
+    Analytics uses this so a session is credited for **every** instant it was open,
+    not only when it happened to win the priority tie-break. Without it the London
+    session bucket silently loses its entire London/NY overlap window (its most
+    active hours) to ``new_york``, and Tokyo loses the Tokyo/London overlap to
+    ``london`` — i.e. those sessions look like they "never recorded" there.
+    """
+    open_: set[str] = set()
+    if session_primary and session_primary != OFF_SESSION:
+        open_.add(session_primary)
+    if session_overlap:
+        for pair, label in OVERLAPS:
+            if label == session_overlap:
+                open_.update(pair)
+                break
+    return frozenset(open_)
 
 
 def seconds_to_next_boundary(

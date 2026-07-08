@@ -76,15 +76,37 @@ def build_collector_coro(name: str, settings, db, health: HealthMonitor):
         return coro
 
     if name == "clob_ws":  # pragma: no cover - live network
+        from sqlalchemy import select
+
+        from ..db.models import Market, MarketToken
         from .clob_ws import ClobWebSocketClient
 
         client = ClobWebSocketClient(settings.clob_ws_url, health=health)
+
+        async def live_token_ids() -> list[str]:
+            # Subscribe to the UP/DOWN tokens of every still-open market discovery
+            # has found. Without this the client subscribes to an empty asset set
+            # and receives nothing.
+            def _load() -> list[str]:
+                with db.session_factory() as s:
+                    open_ids = {
+                        m.id for m in s.execute(
+                            select(Market).where(Market.closed.is_(False))
+                        ).scalars()
+                    }
+                    return [
+                        t.token_id
+                        for t in s.execute(select(MarketToken)).scalars()
+                        if t.market_id in open_ids
+                    ]
+
+            return await asyncio.to_thread(_load)
 
         async def coro(stop):
             def connect_factory(url):
                 return websockets.connect(url)
 
-            await client.run(connect_factory, stop_event=stop)
+            await client.run(connect_factory, stop_event=stop, token_source=live_token_ids)
 
         return coro
 

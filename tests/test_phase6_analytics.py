@@ -305,6 +305,31 @@ def test_timestamp_performance_has_both_directions_and_scopes():
     assert "total" in scopes and "session:new_york" in scopes
 
 
+def test_overlap_credits_both_open_sessions():
+    # During the London/NY overlap the snapshot is stamped session_primary=new_york
+    # (NY has the higher priority) with session_overlap=london_ny_overlap. London
+    # was still open, so it must get per-session credit — otherwise the London
+    # bucket silently loses its most active window to new_york.
+    obs = [
+        SnapshotObs(
+            "t_240", "UP", 0.60, 0.61, 0.59, won=1,
+            session_primary="new_york", session_overlap="london_ny_overlap",
+        )
+        for _ in range(300)
+    ]
+    perf = build_timestamp_performance(obs, fdr_min_n=50)
+    scopes = {p.scope for p in perf}
+    assert "session:new_york" in scopes
+    assert "session:london" in scopes  # the fix: London is credited for the overlap
+    assert "overlap:london_ny_overlap" in scopes
+    # Both single-session scopes see the full population (each obs had both open).
+    ny_n = next(p.n for p in perf if p.scope == "session:new_york"
+                and p.entry_style == "taker_ask" and p.direction == "dominant")
+    ldn_n = next(p.n for p in perf if p.scope == "session:london"
+                 and p.entry_style == "taker_ask" and p.direction == "dominant")
+    assert ny_n == ldn_n == 300
+
+
 def test_price_bin_edges():
     assert price_bin(0.50) == (0.50, 0.52)
     assert price_bin(0.519) == (0.50, 0.52)

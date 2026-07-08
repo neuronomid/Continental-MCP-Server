@@ -202,6 +202,49 @@ async def test_ws_run_loop_with_fake_socket_recovers_from_drop():
     assert mgr.books["tokUP"].best_ask() == 0.65  # recovered with fresh book
 
 
+async def test_ws_run_subscribes_to_token_source():
+    # Regression: the live supervisor never called subscribe(), so clob_ws
+    # subscribed to an empty asset set and collected nothing. With a token_source
+    # the run loop must seed the subscription and put those ids on the wire.
+    mgr = BookManager()
+    client = ClobWebSocketClient("wss://x", book_manager=mgr)
+    stop = asyncio.Event()
+
+    class FakeWS:
+        def __init__(self):
+            self.sent = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def send(self, payload):
+            self.sent.append(payload)
+
+        async def __aiter__(self):
+            stop.set()  # one clean pass, then stop
+            for m in []:
+                yield m
+
+    ws = FakeWS()
+
+    async def token_source():
+        return ["tokUP", "tokDOWN"]
+
+    client.max_backoff_s = 0.01
+    await asyncio.wait_for(
+        client.run(lambda url: ws, stop_event=stop, token_source=token_source),
+        timeout=5,
+    )
+    assert client.asset_ids == {"tokUP", "tokDOWN"}
+    import orjson
+    payload = orjson.loads(ws.sent[0])
+    assert payload["type"] == "market"
+    assert sorted(payload["assets_ids"]) == ["tokDOWN", "tokUP"]
+
+
 # --- REST cross-check -----------------------------------------------------
 def test_compare_books_divergence():
     ws = OrderBook(token_id="t")

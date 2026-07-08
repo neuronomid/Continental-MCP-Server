@@ -13,8 +13,11 @@ automatically):
     * London     08:00–16:30  Europe/London
     * New York   09:30–16:00  America/New_York
 
-Derived labels: ``london_ny_overlap``, ``tokyo_london_overlap`` and
-``off_session``. Holidays never *close* a 24/7 crypto market — they change
+Derived labels: the ``london_ny_overlap`` overlap, plus the two dead-window
+sessions ``pacific`` (New York close → Tokyo open) and ``transitional`` (Tokyo
+close → London open) which, with the three formal sessions, cover the clock 24/7
+(``off_session`` is only a defensive fallback). Holidays never *close* a 24/7
+crypto market — they change
 *participation* — so they are modelled as **session integrity** labels
 (``regular`` | ``holiday`` | ``half_day`` | ``weekend``) driven by the exchange
 calendars (XNYS→New York, XLON→London, XTKS→Tokyo).
@@ -32,14 +35,17 @@ from .calendars import (
 from .model import (
     OFF_SESSION,
     OVERLAPS,
+    PACIFIC,
     SESSION_MODEL_VERSION,
     SESSIONS,
+    TRANSITIONAL,
     SessionDef,
     SessionLabel,
     current_session,
     label_instant,
     materialize_calendar,
     seconds_to_next_boundary,
+    sessions_open_for,
 )
 
 __all__ = [
@@ -47,11 +53,14 @@ __all__ = [
     "SESSIONS",
     "OVERLAPS",
     "OFF_SESSION",
+    "PACIFIC",
+    "TRANSITIONAL",
     "SessionDef",
     "SessionLabel",
     "label_instant",
     "current_session",
     "seconds_to_next_boundary",
+    "sessions_open_for",
     "materialize_calendar",
     "CalendarProvider",
     "ExchangeCalendarsProvider",

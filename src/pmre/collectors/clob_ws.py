@@ -38,8 +38,11 @@ class ClobWebSocketClient:
         self._running = False
         self.reconnects = 0
 
-    def subscribe(self, asset_ids: list[str]) -> None:
-        self.asset_ids.update(asset_ids)
+    def subscribe(self, asset_ids: list[str]) -> bool:
+        """Add asset ids to the subscription set; returns True if any were new."""
+        before = len(self.asset_ids)
+        self.asset_ids.update(str(a) for a in asset_ids)
+        return len(self.asset_ids) > before
 
     def _subscribe_payload(self) -> dict:
         return {"type": "market", "assets_ids": sorted(self.asset_ids)}
@@ -76,19 +79,58 @@ class ClobWebSocketClient:
         delay = min(self.max_backoff_s, (2 ** attempt)) * (0.5 + random.random())
         await asyncio.sleep(delay)
 
-    async def run(self, connect_factory, stop_event: asyncio.Event | None = None) -> None:
+    async def _refresh_loop(self, ws, token_source, stop_event, refresh_s: float) -> None:
+        """Poll ``token_source`` for newly-discovered tokens and subscribe live.
+
+        The Polymarket market channel accepts additional ``assets_ids`` frames on an
+        open socket, so new BTC-5m windows discovered mid-connection are subscribed
+        without a reconnect. Runs until the socket drops (send raises) or we stop.
+        """
+        while self._running and not (stop_event and stop_event.is_set()):
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=refresh_s)
+                return  # stop requested
+            except TimeoutError:
+                pass
+            try:
+                ids = await token_source()
+            except Exception as exc:  # pragma: no cover - defensive
+                log.warning("token_source_failed", error=str(exc))
+                continue
+            if self.subscribe(list(ids)):
+                await ws.send(orjson.dumps(self._subscribe_payload()).decode())
+
+    async def run(
+        self,
+        connect_factory,
+        stop_event: asyncio.Event | None = None,
+        token_source=None,
+        refresh_s: float = 30.0,
+    ) -> None:
         """Connect/consume loop. ``connect_factory`` yields an async-iterable WS.
 
         Injected so the socket can be faked in tests. On any exception the loop
-        flags a gap, backs off and resubscribes.
+        flags a gap, backs off and resubscribes. When ``token_source`` (an async
+        callable → iterable of token ids) is given, a concurrent refresher keeps the
+        subscription current as new markets are discovered.
         """
         self._running = True
         attempt = 0
         while self._running and not (stop_event and stop_event.is_set()):
+            refresher: asyncio.Task | None = None
             try:
                 async with connect_factory(self.ws_url) as ws:
+                    if token_source is not None:
+                        try:
+                            self.subscribe(list(await token_source()))
+                        except Exception as exc:  # pragma: no cover - defensive
+                            log.warning("token_source_failed", error=str(exc))
                     await ws.send(orjson.dumps(self._subscribe_payload()).decode())
                     attempt = 0
+                    if token_source is not None and stop_event is not None:
+                        refresher = asyncio.create_task(
+                            self._refresh_loop(ws, token_source, stop_event, refresh_s)
+                        )
                     async for raw in ws:
                         self.dispatch(raw)
                         if stop_event and stop_event.is_set():
@@ -104,6 +146,9 @@ class ClobWebSocketClient:
                 self.on_reconnect()
                 attempt += 1
                 await self._backoff(attempt)
+            finally:
+                if refresher is not None:
+                    refresher.cancel()
 
     def stop(self) -> None:
         self._running = False

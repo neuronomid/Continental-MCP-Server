@@ -11,6 +11,7 @@ from pm_sessions import (
     label_instant,
     materialize_calendar,
     seconds_to_next_boundary,
+    sessions_open_for,
 )
 from pm_sessions.calendars import StaticCalendarProvider, WeekendOnlyProvider
 from pmre.collectors.calendar_job import CalendarMaterializer
@@ -34,6 +35,19 @@ def test_new_york_afternoon_is_ny_primary():
     assert lbl.session_model_version == SESSION_MODEL_VERSION
 
 
+def test_sessions_open_for_recovers_overlap_members():
+    # From a persisted (primary, overlap) stamp we must recover every open session,
+    # so analytics can credit the non-primary session it would otherwise lose.
+    assert sessions_open_for("new_york", "london_ny_overlap") == frozenset(
+        {"new_york", "london"}
+    )
+    assert sessions_open_for("london", "tokyo_london_overlap") == frozenset(
+        {"london", "tokyo"}
+    )
+    assert sessions_open_for("new_york", None) == frozenset({"new_york"})
+    assert sessions_open_for("off_session", None) == frozenset()
+
+
 def test_tokyo_morning_primary():
     # 2026-07-07 01:00 UTC → 10:00 JST → Tokyo open; London/NY closed.
     lbl = label_instant(utc(2026, 7, 7, 1, 0), PROVIDER)
@@ -41,11 +55,31 @@ def test_tokyo_morning_primary():
     assert lbl.session_overlap is None
 
 
-def test_off_session_dead_hours():
-    # 2026-07-07 06:30 UTC (July→BST): Tokyo 15:30 JST closed, London 07:30 BST not
-    # yet open (opens 08:00 BST = 07:00 UTC), NY 02:30 EDT closed → off_session.
+def test_transitional_gap_tokyo_to_london():
+    # 2026-07-07 06:30 UTC (July→BST): Tokyo 15:30 JST closed (06:00 UTC), London
+    # 07:30 BST not yet open (opens 08:00 BST = 07:00 UTC) → Tokyo→London handover.
     lbl = label_instant(utc(2026, 7, 7, 6, 30), PROVIDER)
-    assert lbl.session_primary == "off_session"
+    assert lbl.session_primary == "transitional"
+    assert lbl.session_overlap is None
+
+
+def test_pacific_gap_ny_to_tokyo():
+    # 2026-07-07 22:00 UTC: NY closed (20:00 UTC summer), Tokyo not open until
+    # 00:00 UTC → New York→Tokyo handover = pacific.
+    lbl = label_instant(utc(2026, 7, 7, 22, 0), PROVIDER)
+    assert lbl.session_primary == "pacific"
+    assert lbl.session_overlap is None
+
+
+def test_sessions_cover_24h_without_off_session():
+    # Every minute of a weekday is a named session — no off_session holes.
+    start = utc(2026, 7, 8, 0, 0)
+    seen = set()
+    for m in range(24 * 60):
+        lbl = label_instant(start + dt.timedelta(minutes=m), PROVIDER)
+        assert lbl.session_primary != "off_session"
+        seen.add(lbl.session_primary)
+    assert seen == {"tokyo", "transitional", "london", "new_york", "pacific"}
 
 
 def test_london_only():
@@ -71,7 +105,8 @@ def test_us_dst_shifts_ny_open_in_utc():
 
 def test_uk_dst_shifts_london_open():
     # London opens 08:00 local. Winter 08:00 UTC; summer (BST) 07:00 UTC.
-    assert label_instant(utc(2026, 1, 15, 7, 30), PROVIDER).session_primary == "off_session"
+    # Winter 07:30 UTC is still the Tokyo→London gap (London not open until 08:00).
+    assert label_instant(utc(2026, 1, 15, 7, 30), PROVIDER).session_primary == "transitional"
     assert label_instant(utc(2026, 7, 15, 7, 30), PROVIDER).session_primary == "london"
 
 
@@ -108,9 +143,9 @@ def test_jpx_holiday_tokyo():
 
 # --- next boundary --------------------------------------------------------
 def test_seconds_to_next_boundary_positive():
-    secs, nxt = seconds_to_next_boundary(utc(2026, 7, 7, 7, 0))  # off_session
+    secs, nxt = seconds_to_next_boundary(utc(2026, 7, 7, 7, 0))  # London just opened
     assert secs > 0
-    assert nxt in {"london", "tokyo", "new_york"}
+    assert nxt in {"london", "tokyo", "new_york", "pacific", "transitional"}
 
 
 # --- materialization ------------------------------------------------------

@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 from sqlalchemy import select
 
+from pm_sessions import sessions_open_for
+
 from ..analytics.calibration import price_bin
 from ..analytics.stats import wilson_lower
 from ..analytics.walkforward import DatedObs, WalkForward
@@ -28,6 +30,7 @@ class DatedSnapshotObs:
     date: dt.date
     label: str
     scope_session: str | None
+    session_overlap: str | None
     session_integrity: str
     dominant_mid: float
     dominant_ask: float | None
@@ -54,6 +57,7 @@ def load_dated_obs(session_factory) -> list[DatedSnapshotObs]:
                     date=snap.captured_at.date(),
                     label=snap.label,
                     scope_session=snap.session_primary,
+                    session_overlap=snap.session_overlap,
                     session_integrity=snap.session_integrity or "regular",
                     dominant_mid=snap.dominant_mid,
                     dominant_ask=snap.dominant_ask,
@@ -69,7 +73,14 @@ def _matches_scope(o: DatedSnapshotObs, scope: str) -> bool:
     if scope == "total":
         return True
     if scope.startswith("session:"):
-        return o.scope_session == scope.split(":", 1)[1]
+        name = scope.split(":", 1)[1]
+        if name == "off_session":
+            return o.scope_session == "off_session"
+        # Mirror calibration._scopes_for: a session owns every obs it was open
+        # for, including overlaps where another session was the primary.
+        return name in sessions_open_for(o.scope_session, o.session_overlap)
+    if scope.startswith("overlap:"):
+        return o.session_overlap == scope.split(":", 1)[1]
     return False
 
 
