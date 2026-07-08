@@ -1,0 +1,7 @@
+[Unit]
+Description=Run PMRE hourly analytics
+[Timer]
+OnCalendar=hourly
+Persistent=true
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+{
+  "id": "599999",
+  "question": "Bitcoin Up or Down - broken outcomes",
+  "slug": "btc-updown-5m-1751911500",
+  "conditionId": "0xbrokencondition",
+  "outcomes": "[\"Up\", \"Up\"]",
+  "clobTokenIds": "[\"111\", \"222\"]",
+  "enableOrderBook": true,
+  "active": true,
+  "closed": false
+}

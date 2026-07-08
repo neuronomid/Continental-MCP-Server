@@ -1,0 +1,17 @@
+{
+  "condition_id": "0xabc123condition",
+  "question_id": "0xdef456question",
+  "enable_order_book": true,
+  "active": true,
+  "closed": false,
+  "minimum_order_size": "5",
+  "minimum_tick_size": "0.001",
+  "fees_enabled": true,
+  "taker_base_fee": 72,
+  "maker_base_fee": 0,
+  "neg_risk": false,
+  "tokens": [
+    {"token_id": "71321045679252212594626385532706912750332728571942532289631379312455583992563", "outcome": "Up", "price": 0.58, "winner": false},
+    {"token_id": "52114319501245915516055106046884209969926127482827954674443846427813813222426", "outcome": "Down", "price": 0.42, "winner": false}
+  ]
+}

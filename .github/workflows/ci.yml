@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Sync deps
+        run: uv sync --all-extras --dev
+      - name: Lint (ruff)
+        run: uv run ruff check src tests
+      - name: Run test suite (incl. golden fixtures + null-dataset FDR guard)
+        run: uv run pytest -q
+      - name: Coverage
+        run: uv run coverage run -m pytest -q && uv run coverage report
+
+  # Optional Postgres+Timescale integration job: same ORM models, real backend.
+  postgres-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_USER: pmre
+          POSTGRES_PASSWORD: pmre
+          POSTGRES_DB: pmre
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U pmre" --health-interval 10s
+          --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --dev
+      - name: Migrate + smoke + hypertable integration test against Postgres
+        env:
+          PMRE_DATABASE_URL: postgresql+psycopg2://pmre:pmre@localhost:5432/pmre
+          PMRE_TEST_POSTGRES_URL: postgresql+psycopg2://pmre:pmre@localhost:5432/pmre
+        run: |
+          uv run python -m pmre migrate
+          uv run python -m pmre materialize-calendar --days 5
+          uv run pytest tests/test_postgres_integration.py -q

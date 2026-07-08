@@ -1,0 +1,9 @@
+{
+  "condition_id": "0xnofeecondition",
+  "enable_order_book": true,
+  "minimum_order_size": "1",
+  "minimum_tick_size": "0.01",
+  "fees_enabled": false,
+  "taker_base_fee": 0,
+  "maker_base_fee": 0
+}

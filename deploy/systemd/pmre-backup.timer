@@ -1,0 +1,7 @@
+[Unit]
+Description=Nightly PMRE pg_dump + restic offsite
+[Timer]
+OnCalendar=*-*-* 04:00:00 UTC
+Persistent=true
+[Install]
+WantedBy=timers.target

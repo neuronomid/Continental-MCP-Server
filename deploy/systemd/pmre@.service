@@ -1,0 +1,27 @@
+# Templated collector/service unit: `systemctl start pmre@snapshotter` etc.
+# Instance name (%i) is passed as the CLI subcommand's collector name.
+[Unit]
+Description=pm-research-engine %i
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=all
+WatchdogSec=180
+User=pmre
+Group=pmre
+WorkingDirectory=/opt/pm-research-engine
+EnvironmentFile=/opt/pm-research-engine/.env
+ExecStart=/opt/pm-research-engine/.venv/bin/python -m pmre collector %i
+Restart=always
+RestartSec=5
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/data
+
+[Install]
+WantedBy=multi-user.target

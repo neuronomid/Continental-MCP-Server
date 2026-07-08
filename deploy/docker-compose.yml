@@ -1,0 +1,56 @@
+# Docker Compose alternative to systemd (mcp_plan.md §8). Bind published ports to
+# the WireGuard/Tailscale overlay IP only — never 0.0.0.0.
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: pmre
+      POSTGRES_PASSWORD: ${PMRE_DB_PASSWORD:-changeme}
+      POSTGRES_DB: pmre
+    volumes:
+      - pmre_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pmre"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  migrate:
+    build: ..
+    command: ["python", "-m", "pmre", "migrate"]
+    env_file: ../.env
+    depends_on:
+      db: {condition: service_healthy}
+
+  btc_feed:
+    build: ..
+    command: ["python", "-m", "pmre", "collector", "btc_feed"]
+    env_file: ../.env
+    restart: unless-stopped
+    depends_on: {migrate: {condition: service_completed_successfully}}
+
+  clob_ws:
+    build: ..
+    command: ["python", "-m", "pmre", "collector", "clob_ws"]
+    env_file: ../.env
+    restart: unless-stopped
+    depends_on: {migrate: {condition: service_completed_successfully}}
+
+  rest:
+    build: ..
+    command: ["python", "-m", "pmre", "serve-rest"]
+    env_file: ../.env
+    restart: unless-stopped
+    ports: ["${PMRE_SERVING_HOST:-127.0.0.1}:8080:8080"]
+    depends_on: {migrate: {condition: service_completed_successfully}}
+
+  mcp:
+    build: ..
+    command: ["python", "-m", "pmre", "serve-mcp"]
+    env_file: ../.env
+    restart: unless-stopped
+    ports: ["${PMRE_SERVING_HOST:-127.0.0.1}:8090:8090"]
+    depends_on: {migrate: {condition: service_completed_successfully}}
+
+volumes:
+  pmre_pgdata:

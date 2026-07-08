@@ -1,0 +1,17 @@
+{
+  "id": "512345",
+  "question": "Bitcoin Up or Down - Jul 7, 6:00 PM ET",
+  "slug": "btc-updown-5m-1783447200",
+  "conditionId": "0xabc123condition",
+  "questionID": "0xdef456question",
+  "startDate": "2026-07-07T18:00:00Z",
+  "endDate": "2026-07-07T18:05:00Z",
+  "outcomes": "[\"Up\", \"Down\"]",
+  "outcomePrices": "[\"0.58\", \"0.42\"]",
+  "clobTokenIds": "[\"71321045679252212594626385532706912750332728571942532289631379312455583992563\", \"52114319501245915516055106046884209969926127482827954674443846427813813222426\"]",
+  "enableOrderBook": true,
+  "active": true,
+  "closed": false,
+  "priceToBeat": 108250.5,
+  "events": [{"slug": "btc-updown-5m-jul-7"}]
+}

@@ -1,0 +1,21 @@
+[Unit]
+Description=pm-research-engine MCP server
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pmre
+Group=pmre
+WorkingDirectory=/opt/pm-research-engine
+EnvironmentFile=/opt/pm-research-engine/.env
+ExecStart=/opt/pm-research-engine/.venv/bin/python -m pmre serve-mcp
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

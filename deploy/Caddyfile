@@ -1,0 +1,17 @@
+# Optional TLS reverse proxy. PREFERRED deployment is no public exposure at all:
+# bind REST/MCP to the WireGuard/Tailscale overlay IP and skip this entirely.
+# If you must terminate TLS, bind Caddy to the overlay interface only.
+
+{$PMRE_OVERLAY_HOST:100.64.0.1}:8443 {
+    @mcp path /mcp*
+    handle @mcp {
+        reverse_proxy 127.0.0.1:8090
+    }
+    handle {
+        reverse_proxy 127.0.0.1:8080
+    }
+    tls internal
+    log {
+        output file /var/log/caddy/pmre.log
+    }
+}

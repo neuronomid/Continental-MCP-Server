@@ -1,0 +1,19 @@
+{
+  "asset_id": "tokUP",
+  "events": [
+    {"event_type": "book", "asset_id": "tokUP", "timestamp": 1783447000000,
+     "bids": [{"price": "0.58", "size": "100"}, {"price": "0.57", "size": "250"}, {"price": "0.55", "size": "500"}],
+     "asks": [{"price": "0.60", "size": "120"}, {"price": "0.61", "size": "300"}, {"price": "0.63", "size": "400"}]},
+    {"event_type": "price_change", "asset_id": "tokUP", "timestamp": 1783447001000,
+     "changes": [{"price": "0.60", "side": "SELL", "size": "0"}, {"price": "0.59", "side": "SELL", "size": "80"}]},
+    {"event_type": "last_trade_price", "asset_id": "tokUP", "timestamp": 1783447001500, "price": "0.59", "size": "40", "side": "BUY"},
+    {"event_type": "price_change", "asset_id": "tokUP", "timestamp": 1783447002000,
+     "changes": [{"price": "0.58", "side": "BUY", "size": "150"}, {"price": "0.56", "side": "BUY", "size": "300"}]}
+  ],
+  "expected_rest_book": {
+    "asset_id": "tokUP",
+    "bids": [{"price": "0.58", "size": "150"}, {"price": "0.57", "size": "250"}, {"price": "0.56", "size": "300"}, {"price": "0.55", "size": "500"}],
+    "asks": [{"price": "0.59", "size": "80"}, {"price": "0.61", "size": "300"}, {"price": "0.63", "size": "400"}]
+  },
+  "expected_last_trade_price": 0.59
+}

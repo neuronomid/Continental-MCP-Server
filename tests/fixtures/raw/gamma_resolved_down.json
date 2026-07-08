@@ -1,0 +1,10 @@
+{
+  "slug": "btc-updown-5m-1783447500",
+  "conditionId": "0xdef789condition",
+  "outcomes": "[\"Up\", \"Down\"]",
+  "outcomePrices": "[\"0\", \"1\"]",
+  "closed": true,
+  "active": false,
+  "umaResolutionStatus": "resolved",
+  "endDate": "2026-07-07T18:10:00Z"
+}
