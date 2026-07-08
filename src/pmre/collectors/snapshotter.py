@@ -6,9 +6,15 @@ import asyncio
 import datetime as dt
 from dataclasses import dataclass, field
 
+import httpx
+from sqlalchemy import select
+from tenacity import retry, stop_after_attempt, wait_exponential_jitter
+
 from .. import COLLECTOR_VERSION, FEATURE_VERSION, NET_EV_INPUTS_VERSION
 from ..feecurve import taker_fee_per_share
+from ..logging_setup import get_logger
 from .orderbook import OrderBook
+from .slugs import parse_slug_start, start_dt
 
 DEFAULT_OFFSETS = (270, 240, 210, 180, 150, 120, 90, 60, 30)
 DEFAULT_NOTIONALS = (1, 2, 5, 10)
@@ -265,3 +271,211 @@ def persist_snapshot(session_factory, built: SnapshotFields) -> int:
         sid = snap.id
         s.commit()
         return sid
+
+
+# --- live run-loop ---------------------------------------------------------
+class ClobBookClient:
+    """CLOB REST ``GET /book`` — one call per token, materialised into an OrderBook.
+
+    A separate snapshotter process cannot see the ``clob_ws`` collector's live
+    in-memory books, so it pulls a point-in-time REST snapshot at each fire time.
+    The response shape (``bids``/``asks`` of ``{price,size}`` + ``tick_size`` +
+    ``last_trade_price``) is exactly what :meth:`OrderBook.apply_book` consumes.
+    """
+
+    def __init__(self, base_url: str, user_agent: str, timeout: float = 15.0):
+        self.base_url = base_url.rstrip("/")
+        self.headers = {"User-Agent": user_agent}
+        self.timeout = timeout
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(initial=0.3, max=5))
+    async def fetch_book(self, token_id: str, outcome: str | None = None) -> OrderBook:
+        async with httpx.AsyncClient(timeout=self.timeout, headers=self.headers) as c:
+            resp = await c.get(f"{self.base_url}/book", params={"token_id": token_id})
+            resp.raise_for_status()
+            data = resp.json()
+        book = OrderBook(
+            token_id=str(token_id), outcome=outcome, tick_size=float(data.get("tick_size") or 0.001)
+        )
+        book.apply_book(data)
+        ltp = data.get("last_trade_price")
+        if ltp not in (None, ""):
+            try:
+                book.last_trade_price = float(ltp)
+            except (TypeError, ValueError):
+                pass
+        return book
+
+
+@dataclass
+class _SnapMarket:
+    """Everything the snapshot loop needs about one market (no live ORM object)."""
+
+    id: int
+    slug: str
+    resolution: dt.datetime
+    window_start: dt.datetime | None
+    up_token: str
+    down_token: str
+    price_to_beat: float | None
+    tick_size: float | None
+
+
+class SnapshotCollector:
+    """Live snapshotter: tracks each upcoming market and captures t_270…t_30 rows.
+
+    Polls for markets whose window is open/upcoming and, per market, drives the
+    tested :class:`SnapshotScheduler`. At each fire it pulls both order books via
+    REST, reconstructs BTC/fair-value state from ``btc_ticks``, stamps the session,
+    and persists a full snapshot (+ its top-10 levels).
+    """
+
+    def __init__(self, session_factory, settings, health=None, book_client: ClobBookClient | None = None):
+        self.session_factory = session_factory
+        self.settings = settings
+        self.health = health
+        self.book_client = book_client or ClobBookClient(settings.clob_base_url, settings.user_agent)
+        self.scheduler = SnapshotScheduler(settings.snapshot_offsets_s)
+        self.builder = SnapshotBuilder()
+        self.fee_rate = settings.default_fee_rate
+        self.poll_s = 5.0
+        self.max_offset = max(settings.snapshot_offsets_s)
+        self.log = get_logger("collectors.snapshotter")
+        self._tracked: set[int] = set()
+
+    # -- market selection --------------------------------------------------
+    def _resolution_time(self, slug: str, fallback: dt.datetime | None) -> dt.datetime | None:
+        try:
+            return start_dt(parse_slug_start(slug) + 300)
+        except ValueError:
+            return fallback
+
+    def _window_start(self, slug: str, fallback: dt.datetime | None) -> dt.datetime | None:
+        try:
+            return start_dt(parse_slug_start(slug))
+        except ValueError:
+            return fallback
+
+    def due_markets(self, now: dt.datetime) -> list[_SnapMarket]:
+        from ..db.models import Market, MarketResolution, MarketToken
+
+        due: list[_SnapMarket] = []
+        with self.session_factory() as s:
+            resolved = {r.market_id for r in s.execute(select(MarketResolution)).scalars()}
+            for m in s.execute(select(Market).where(Market.closed.is_(False))).scalars():
+                if m.id in resolved:
+                    continue
+                res = self._resolution_time(m.slug, m.expected_resolution_time_utc)
+                if res is None or res <= now:
+                    continue  # already past this window's close
+                earliest = res - dt.timedelta(seconds=self.max_offset)
+                # Track once the first snapshot is within one poll of firing.
+                if earliest > now + dt.timedelta(seconds=self.poll_s):
+                    continue
+                tokens = {
+                    t.outcome: t.token_id
+                    for t in s.execute(
+                        select(MarketToken).where(MarketToken.market_id == m.id)
+                    ).scalars()
+                }
+                if "UP" not in tokens or "DOWN" not in tokens:
+                    continue
+                due.append(
+                    _SnapMarket(
+                        id=m.id,
+                        slug=m.slug,
+                        resolution=res,
+                        window_start=self._window_start(m.slug, m.slug_derived_start_utc),
+                        up_token=tokens["UP"],
+                        down_token=tokens["DOWN"],
+                        price_to_beat=m.price_to_beat,
+                        tick_size=m.tick_size,
+                    )
+                )
+        return due
+
+    # -- capture -----------------------------------------------------------
+    def _persist_price_to_beat(self, market_id: int, ptb: float) -> None:
+        from ..db.models import Market
+
+        with self.session_factory() as s:
+            m = s.get(Market, market_id)
+            if m is not None and m.price_to_beat is None:
+                m.price_to_beat = ptb
+                m.price_to_beat_source = "btc_proxy_open"
+                s.commit()
+
+    async def capture(self, market: _SnapMarket, target: SnapshotTarget, fire_time: dt.datetime,
+                      actual_seconds_left: float) -> int | None:
+        from pm_sessions import label_instant
+
+        from ..features.btc_history import btc_price_at, build_btc_feature_state
+
+        try:
+            up_book = await self.book_client.fetch_book(market.up_token, "UP")
+            down_book = await self.book_client.fetch_book(market.down_token, "DOWN")
+        except Exception as exc:  # pragma: no cover - live network
+            if self.health:
+                self.health.warning(
+                    "snapshotter", f"book fetch failed m{market.id} {target.label}", {"error": str(exc)}
+                )
+            return None
+
+        # price-to-beat = platform value, else the BTC proxy price at the window open.
+        ptb = market.price_to_beat
+        if ptb is None and market.window_start is not None:
+            ptb = btc_price_at(self.session_factory, market.window_start)
+            if ptb is not None:
+                self._persist_price_to_beat(market.id, ptb)
+                market.price_to_beat = ptb
+
+        fs, secondary = build_btc_feature_state(self.session_factory, fire_time)
+        btc = fs.build_btc_state(ptb, actual_seconds_left, secondary)
+        session_label = label_instant(fire_time)
+        meta = MarketMeta(
+            market_id=market.id,
+            price_to_beat=ptb,
+            fee_rate=self.fee_rate,
+            up_tick_size=market.tick_size,
+        )
+        built = self.builder.build(
+            meta, up_book, down_book, target.label, target.offset, fire_time,
+            actual_seconds_left, session_label=session_label, btc=btc,
+        )
+        return persist_snapshot(self.session_factory, built)
+
+    async def _snapshot_market(self, market: _SnapMarket) -> None:
+        async def on_fire(target, fire_time, actual):
+            await self.capture(market, target, fire_time, actual)
+
+        try:
+            await self.scheduler.run(market.resolution, on_fire)
+            self.log.info("snapshot_market_done", market_id=market.id, slug=market.slug)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive
+            if self.health:
+                self.health.warning("snapshotter", f"snapshot market {market.id} failed", {"error": str(exc)})
+        finally:
+            self._tracked.discard(market.id)
+
+    async def run(self, stop: asyncio.Event) -> None:
+        tasks: set[asyncio.Task] = set()
+        try:
+            while not stop.is_set():
+                for market in self.due_markets(dt.datetime.now(dt.UTC)):
+                    if market.id in self._tracked:
+                        continue
+                    self._tracked.add(market.id)
+                    task = asyncio.create_task(self._snapshot_market(market))
+                    tasks.add(task)
+                    task.add_done_callback(tasks.discard)
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=self.poll_s)
+                except TimeoutError:
+                    pass
+        finally:
+            for task in list(tasks):
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)

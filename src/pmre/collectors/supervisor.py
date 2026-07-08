@@ -98,10 +98,28 @@ def build_collector_coro(name: str, settings, db, health: HealthMonitor):
 
         return coro
 
-    # snapshotter / resolution: run-loops not yet implemented — periodic no-op that
-    # only keeps the heartbeat alive (see build note). Discovery/btc_feed/clob_ws
-    # have real loops above.
-    async def periodic(stop):  # pragma: no cover - live network
+    if name == "snapshotter":  # pragma: no cover - live network
+        from .snapshotter import SnapshotCollector
+
+        snap = SnapshotCollector(db.session_factory, settings, health=health)
+
+        async def coro(stop):
+            await snap.run(stop)
+
+        return coro
+
+    if name == "resolution":  # pragma: no cover - live network
+        from .resolution import ResolutionCollector
+
+        res = ResolutionCollector(db.session_factory, settings, health=health)
+
+        async def coro(stop):
+            await res.run(stop)
+
+        return coro
+
+    # Fallback (unreached: all five collectors have real loops) — heartbeat-only.
+    async def periodic(stop):  # pragma: no cover - defensive
         while not stop.is_set():
             try:
                 await asyncio.sleep(min(settings.market_period_s, 30))

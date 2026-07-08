@@ -231,9 +231,15 @@ class GammaClient:
         self.timeout = timeout
 
     @retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=0.5, max=10))
-    async def get_market_by_slug(self, slug: str) -> dict | None:
+    async def get_market_by_slug(self, slug: str, closed: bool | None = None) -> dict | None:
+        # Gamma's /markets?slug= implicitly returns only *active* markets, so a
+        # resolved 5-minute window is dropped unless closed=true is requested
+        # (discovery wants the live/active market; resolution wants the closed one).
+        params: dict[str, str] = {"slug": slug}
+        if closed is not None:
+            params["closed"] = "true" if closed else "false"
         async with httpx.AsyncClient(timeout=self.timeout, headers=self.headers) as c:
-            resp = await c.get(f"{self.base_url}/markets", params={"slug": slug})
+            resp = await c.get(f"{self.base_url}/markets", params=params)
             resp.raise_for_status()
             data = resp.json()
             if isinstance(data, list):

@@ -7,12 +7,15 @@ exactly: ``end ≥ start → UP`` (mcp_plan.md §1.2 / mcp_phases.md Phase 4).
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 from dataclasses import dataclass
 
 from sqlalchemy import select
 
-from .discovery import _maybe_json_list, _normalize_outcome, _parse_dt
+from ..logging_setup import get_logger
+from .discovery import GammaClient, _maybe_json_list, _normalize_outcome, _parse_dt
+from .slugs import parse_slug_start, start_dt
 
 
 @dataclass
@@ -202,3 +205,117 @@ class ResolutionService:
                 "resolution", f"{len(overdue)} markets unresolved past grace", {"ids": overdue[:20]}
             )
         return overdue
+
+
+# --- live run-loop ---------------------------------------------------------
+@dataclass
+class _DueMarket:
+    id: int
+    slug: str
+    resolution: dt.datetime
+    window_start: dt.datetime | None
+    price_to_beat: float | None
+
+
+class ResolutionCollector:
+    """Periodically reconciles finished windows against the platform's resolution.
+
+    Truth is the resolved Gamma outcome (never inferred from a final price). Each
+    sweep finds windows past their close + grace with no resolution row, fetches
+    the market, and — once genuinely resolved — records the winner, close-call
+    margin (proxy-end vs price-to-beat) and proxy/oracle divergence, which
+    back-labels every snapshot's ``was_correct_*``.
+    """
+
+    def __init__(self, session_factory, settings, health=None, gamma: GammaClient | None = None,
+                 grace_minutes: float = 2.0):
+        self.session_factory = session_factory
+        self.settings = settings
+        self.health = health
+        self.gamma = gamma or GammaClient(settings.gamma_base_url, settings.user_agent)
+        self.service = ResolutionService(
+            session_factory, health=health, close_call_bps=settings.close_call_bps
+        )
+        self.grace_minutes = grace_minutes
+        self.period_s = min(settings.market_period_s, 30)
+        self.log = get_logger("collectors.resolution")
+
+    def _resolution_time(self, slug: str, fallback: dt.datetime | None) -> dt.datetime | None:
+        try:
+            return start_dt(parse_slug_start(slug) + 300)
+        except ValueError:
+            return fallback
+
+    def _window_start(self, slug: str, fallback: dt.datetime | None) -> dt.datetime | None:
+        try:
+            return start_dt(parse_slug_start(slug))
+        except ValueError:
+            return fallback
+
+    def due_markets(self, now: dt.datetime) -> list[_DueMarket]:
+        from ..db.models import Market, MarketResolution
+
+        deadline = now - dt.timedelta(minutes=self.grace_minutes)
+        out: list[_DueMarket] = []
+        with self.session_factory() as s:
+            resolved = {r.market_id for r in s.execute(select(MarketResolution)).scalars()}
+            for m in s.execute(select(Market)).scalars():
+                if m.id in resolved:
+                    continue
+                res = self._resolution_time(m.slug, m.expected_resolution_time_utc)
+                if res is None or res >= deadline:
+                    continue
+                out.append(
+                    _DueMarket(
+                        id=m.id,
+                        slug=m.slug,
+                        resolution=res,
+                        window_start=self._window_start(m.slug, m.slug_derived_start_utc),
+                        price_to_beat=m.price_to_beat,
+                    )
+                )
+        return out
+
+    async def resolve_due_once(self, now: dt.datetime | None = None) -> int:
+        from ..features.btc_history import btc_price_at
+
+        now = now or dt.datetime.now(dt.UTC)
+        resolved = 0
+        for m in self.due_markets(now):
+            try:
+                # closed=true: a settled window is dropped by Gamma's default active filter.
+                raw = await self.gamma.get_market_by_slug(m.slug, closed=True)
+            except Exception as exc:  # pragma: no cover - live network
+                if self.health:
+                    self.health.warning("resolution", f"gamma fetch failed: {m.slug}", {"error": str(exc)})
+                continue
+            if not raw:
+                continue
+            parsed = parse_resolution(raw)
+            if not parsed.resolved:
+                continue  # closed/settled but no clear winner yet — retry next sweep
+            proxy_end = btc_price_at(self.session_factory, m.resolution)
+            ptb = m.price_to_beat
+            if ptb is None and m.window_start is not None:
+                ptb = btc_price_at(self.session_factory, m.window_start)
+            try:
+                self.service.resolve(m.id, parsed, proxy_end=proxy_end, price_to_beat=ptb)
+                resolved += 1
+            except Exception as exc:  # pragma: no cover - defensive
+                if self.health:
+                    self.health.warning("resolution", f"resolve failed m{m.id}", {"error": str(exc)})
+        return resolved
+
+    async def run(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            try:
+                n = await self.resolve_due_once()
+                if n:
+                    self.log.info("resolution_sweep", resolved=n)
+            except Exception as exc:  # pragma: no cover - defensive
+                if self.health:
+                    self.health.warning("resolution", f"resolution sweep error: {exc}")
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=self.period_s)
+            except TimeoutError:
+                pass
