@@ -27,7 +27,7 @@ EVIDENCE_NOTE = (
 def create_mcp_server(session_factory, settings: Settings | None = None) -> FastMCP:
     settings = settings or Settings()
     service = ResearchService(session_factory, settings)
-    mcp = FastMCP(name="pm-research-engine", instructions=EVIDENCE_NOTE)
+    mcp = FastMCP(name="pm-research-engine", instructions=EVIDENCE_NOTE, host=settings.serving_host)
 
     def enveloped(fn):
         """Wrap a data-returning function so it always ships the full envelope."""
