@@ -7,6 +7,7 @@ so parsers can be golden-fixture tested without a network.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 from dataclasses import dataclass, field
@@ -16,7 +17,8 @@ import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter
 
 from .. import COLLECTOR_VERSION
-from .slugs import parse_slug_start, start_dt
+from ..logging_setup import get_logger
+from .slugs import expected_windows, parse_slug_start, start_dt
 
 
 class AmbiguousMappingError(ValueError):
@@ -346,3 +348,80 @@ class DiscoveryService:
             self.health.warning(
                 "discovery", f"ambiguous outcome mapping refused: {slug}", {"error": str(error)}
             )
+
+
+# --- live run-loop ---------------------------------------------------------
+class DiscoveryCollector:
+    """Periodic, slug-driven market discovery against the live Gamma/CLOB APIs.
+
+    Each sweep resolves the current + next ``window_lookahead`` 5-minute windows to
+    deterministic ``btc-updown-5m-<unix>`` slugs (see :mod:`.slugs`), looks each up
+    on Gamma, normalises it (refusing ambiguous UP/DOWN maps), enriches it with CLOB
+    fee/tick params, and upserts it via :class:`DiscoveryService`. All network calls
+    are best-effort: a failure on one slug is logged and skipped so the loop — and
+    the collector's heartbeat — stay alive.
+    """
+
+    def __init__(
+        self,
+        session_factory,
+        settings,
+        health=None,
+        *,
+        window_lookahead: int = 3,
+    ):
+        self.gamma = GammaClient(settings.gamma_base_url, settings.user_agent)
+        self.clob = ClobClient(settings.clob_base_url, settings.user_agent)
+        self.service = DiscoveryService(
+            session_factory, health=health, fee_model_version=settings.fee_model_version
+        )
+        self.health = health
+        self.window_lookahead = window_lookahead
+        # Sweep well within a 5-minute window so a new market is captured promptly.
+        self.period_s = min(settings.market_period_s, 30)
+        self.log = get_logger("collectors.discovery")
+
+    async def discover_once(self, now: dt.datetime | None = None) -> int:
+        """Resolve + upsert the current and upcoming windows; return #markets upserted."""
+        now = now or dt.datetime.now(dt.UTC)
+        found = 0
+        for _unix, slug in expected_windows(now, self.window_lookahead):
+            try:
+                raw = await self.gamma.get_market_by_slug(slug)
+            except Exception as exc:
+                if self.health:
+                    self.health.warning("discovery", f"gamma lookup failed: {slug}", {"error": str(exc)})
+                continue
+            if not raw:
+                continue  # window not listed yet — normal for the far edge of the lookahead
+            try:
+                parsed = parse_gamma_market(raw)
+            except AmbiguousMappingError as exc:
+                self.service.handle_ambiguous(slug, exc)
+                continue
+            fees = None
+            if parsed.condition_id:
+                try:
+                    info = await self.clob.get_market_info(parsed.condition_id)
+                    fees = parse_clob_market_info(info)
+                except Exception as exc:
+                    if self.health:
+                        self.health.warning(
+                            "discovery", f"clob market-info failed: {slug}", {"error": str(exc)}
+                        )
+            self.service.upsert_market(parsed, fees, discovered_via="slug")
+            found += 1
+        return found
+
+    async def run(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            try:
+                n = await self.discover_once()
+                self.log.info("discovery_sweep", markets_upserted=n)
+            except Exception as exc:  # pragma: no cover - defensive; keep the loop alive
+                if self.health:
+                    self.health.warning("discovery", f"discovery sweep error: {exc}")
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=self.period_s)
+            except TimeoutError:
+                pass

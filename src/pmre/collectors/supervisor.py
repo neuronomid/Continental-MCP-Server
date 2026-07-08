@@ -88,7 +88,19 @@ def build_collector_coro(name: str, settings, db, health: HealthMonitor):
 
         return coro
 
-    # discovery / snapshotter / resolution run periodic loops.
+    if name == "discovery":  # pragma: no cover - live network
+        from .discovery import DiscoveryCollector
+
+        collector = DiscoveryCollector(db.session_factory, settings, health=health)
+
+        async def coro(stop):
+            await collector.run(stop)
+
+        return coro
+
+    # snapshotter / resolution: run-loops not yet implemented — periodic no-op that
+    # only keeps the heartbeat alive (see build note). Discovery/btc_feed/clob_ws
+    # have real loops above.
     async def periodic(stop):  # pragma: no cover - live network
         while not stop.is_set():
             try:
