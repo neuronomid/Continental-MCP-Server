@@ -258,14 +258,26 @@ def _levels(book: OrderBook, outcome: str, n: int = 10) -> list[dict]:
     return out
 
 
-def persist_snapshot(session_factory, built: SnapshotFields) -> int:
-    """Write a snapshot + its top-10 orderbook levels; returns snapshot id."""
+def persist_snapshot(session_factory, built: SnapshotFields) -> int | None:
+    """Write a snapshot + its top-10 orderbook levels; returns snapshot id.
+
+    Idempotent on the ``(market_id, label)`` unique key: if that offset was
+    already captured (e.g. the collector process restarted mid-window and the
+    scheduler is catching up past offsets), the insert is skipped and ``None``
+    is returned instead of raising — a re-capture is a no-op, not a failure.
+    """
+    from sqlalchemy.exc import IntegrityError
+
     from ..db.models import OrderbookLevel, Snapshot
 
     with session_factory() as s:
         snap = Snapshot(**built.fields)
         s.add(snap)
-        s.flush()
+        try:
+            s.flush()
+        except IntegrityError:
+            s.rollback()
+            return None
         for lvl in built.up_levels + built.down_levels:
             s.add(OrderbookLevel(snapshot_id=snap.id, **lvl))
         sid = snap.id
@@ -341,7 +353,13 @@ class SnapshotCollector:
         self.poll_s = 5.0
         self.max_offset = max(settings.snapshot_offsets_s)
         self.log = get_logger("collectors.snapshotter")
-        self._tracked: set[int] = set()
+        # market_id -> resolution time of markets already scheduled this process.
+        # A market is scheduled exactly once; entries are pruned once their
+        # window closes (see ``run``). Discarding on task completion instead
+        # would re-schedule the market for the ~30s between its last offset and
+        # resolution, re-firing every already-captured offset (duplicate-key
+        # storm against ``uq_snapshot_market_label``).
+        self._tracked: dict[int, dt.datetime] = {}
 
     # -- market selection --------------------------------------------------
     def _resolution_time(self, slug: str, fallback: dt.datetime | None) -> dt.datetime | None:
@@ -456,20 +474,28 @@ class SnapshotCollector:
         except Exception as exc:  # pragma: no cover - defensive
             if self.health:
                 self.health.warning("snapshotter", f"snapshot market {market.id} failed", {"error": str(exc)})
-        finally:
-            self._tracked.discard(market.id)
+        # NOTE: intentionally do not un-track here — the market's window is still
+        # open, and re-scheduling would re-fire its already-captured offsets.
+        # ``run`` prunes the entry once the resolution time has passed.
 
     async def run(self, stop: asyncio.Event) -> None:
         tasks: set[asyncio.Task] = set()
         try:
             while not stop.is_set():
-                for market in self.due_markets(dt.datetime.now(dt.UTC)):
+                now = dt.datetime.now(dt.UTC)
+                for market in self.due_markets(now):
                     if market.id in self._tracked:
                         continue
-                    self._tracked.add(market.id)
+                    self._tracked[market.id] = market.resolution
                     task = asyncio.create_task(self._snapshot_market(market))
                     tasks.add(task)
                     task.add_done_callback(tasks.discard)
+                # Drop markets whose window has fully closed so the set stays
+                # bounded; a resolved/past market is never 'due' again, so this
+                # cannot cause a re-schedule.
+                self._tracked = {
+                    mid: res for mid, res in self._tracked.items() if res > now
+                }
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=self.poll_s)
                 except TimeoutError:

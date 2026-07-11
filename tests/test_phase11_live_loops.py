@@ -15,7 +15,12 @@ from sqlalchemy import select
 from pmre.collectors.orderbook import OrderBook
 from pmre.collectors.resolution import ResolutionCollector
 from pmre.collectors.slugs import parse_slug_start, start_dt
-from pmre.collectors.snapshotter import SnapshotCollector, SnapshotTarget, _SnapMarket
+from pmre.collectors.snapshotter import (
+    MarketMeta,
+    SnapshotCollector,
+    SnapshotTarget,
+    _SnapMarket,
+)
 from pmre.config import Settings
 from pmre.db.models import (
     BtcTick,
@@ -143,6 +148,81 @@ def test_due_markets_selects_upcoming_only(db):
     due_ids = {d.id for d in collector.due_markets(now)}
     assert up_id in due_ids
     assert len(due_ids) == 1
+
+
+@pytest.mark.asyncio
+async def test_persist_snapshot_idempotent_on_duplicate(db):
+    """A second capture of the same (market_id, label) is a no-op, not an error."""
+    from pmre.collectors.snapshotter import SnapshotBuilder
+
+    slug = "btc-updown-5m-1783447200"
+    res = start_dt(parse_slug_start(slug) + 300)
+    with db.session_factory() as s:
+        m = Market(slug=slug, closed=False, expected_resolution_time_utc=res)
+        s.add(m)
+        s.flush()
+        mid = m.id
+        s.commit()
+
+    up = OrderBook(token_id="U", outcome="UP")
+    up.apply_book({"bids": [{"price": "0.59", "size": "100"}], "asks": [{"price": "0.61", "size": "100"}]})
+    dn = OrderBook(token_id="D", outcome="DOWN")
+    dn.apply_book({"bids": [{"price": "0.39", "size": "100"}], "asks": [{"price": "0.41", "size": "100"}]})
+    built = SnapshotBuilder().build(
+        MarketMeta(market_id=mid), up, dn, "t_270", 270, res - dt.timedelta(seconds=270), 270.0
+    )
+    from pmre.collectors.snapshotter import persist_snapshot
+
+    first = persist_snapshot(db.session_factory, built)
+    assert first is not None
+    second = persist_snapshot(db.session_factory, built)  # same (market_id, label)
+    assert second is None  # skipped, did not raise
+    with db.session() as s:
+        assert len(s.execute(select(Snapshot).where(Snapshot.market_id == mid)).scalars().all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_schedules_each_due_market_once(db):
+    """A market that is still 'due' after its task finishes must not be re-scheduled.
+
+    Regression for the duplicate-key storm: previously the market was un-tracked
+    on task completion and re-fired every already-captured offset each poll until
+    resolution passed.
+    """
+    import asyncio
+
+    now = dt.datetime.now(dt.UTC)
+    res = now + dt.timedelta(seconds=120)  # window open, resolution in the future
+    slug = f"btc-updown-5m-{int((res - dt.timedelta(seconds=300)).timestamp())}"
+    with db.session_factory() as s:
+        m = Market(slug=slug, closed=False, expected_resolution_time_utc=res)
+        s.add(m)
+        s.flush()
+        s.add_all([
+            MarketToken(market_id=m.id, token_id="U", outcome="UP", outcome_index=0),
+            MarketToken(market_id=m.id, token_id="D", outcome="DOWN", outcome_index=1),
+        ])
+        mid = m.id
+        s.commit()
+
+    collector = SnapshotCollector(db.session_factory, _settings())
+    collector.poll_s = 0.02
+    calls = {"n": 0}
+
+    async def fake_snapshot(market):  # completes immediately (task finished early)
+        calls["n"] += 1
+
+    collector._snapshot_market = fake_snapshot
+
+    stop = asyncio.Event()
+
+    async def stopper():
+        await asyncio.sleep(0.25)  # ~12 poll cycles
+        stop.set()
+
+    await asyncio.gather(collector.run(stop), stopper())
+    assert calls["n"] == 1                 # scheduled exactly once despite many polls
+    assert mid in collector._tracked       # still tracked while its window is open
 
 
 # --- resolution ------------------------------------------------------------

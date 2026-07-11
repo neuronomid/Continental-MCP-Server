@@ -92,7 +92,11 @@ def build_snapshots_features(session_factory, date: dt.date) -> pl.DataFrame:
                     "feature_version": snap.feature_version or FEATURE_VERSION,
                 }
             )
-    return pl.DataFrame(rows) if rows else pl.DataFrame()
+    # infer_schema_length=None scans every row for dtype inference. Without it,
+    # a column that is null for the first 100 rows (e.g. session_overlap outside
+    # overlap windows, or regime) is inferred as Null and then errors when a real
+    # value ("london_ny_overlap") appears later in the day.
+    return pl.DataFrame(rows, infer_schema_length=None) if rows else pl.DataFrame()
 
 
 def _simple_table(session_factory, model, ts_col: str, date: dt.date, cols: list[str]) -> pl.DataFrame:
@@ -102,7 +106,7 @@ def _simple_table(session_factory, model, ts_col: str, date: dt.date, cols: list
     with session_factory() as s:
         for obj in s.execute(select(model).where(col >= start, col < end)).scalars():
             rows.append({c: _naive(getattr(obj, c)) if isinstance(getattr(obj, c), dt.datetime) else getattr(obj, c) for c in cols})
-    return pl.DataFrame(rows) if rows else pl.DataFrame()
+    return pl.DataFrame(rows, infer_schema_length=None) if rows else pl.DataFrame()
 
 
 class ParquetExporter:

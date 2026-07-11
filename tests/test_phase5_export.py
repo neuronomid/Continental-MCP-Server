@@ -59,6 +59,37 @@ def test_export_rowcount_reconciliation(db, tmp_path):
     assert "feature_version" in df.columns
 
 
+def test_export_handles_late_appearing_string_in_nullable_column(db, tmp_path):
+    """A column null for the first 100+ rows then a string must not break inference.
+
+    Regression: ``session_overlap`` is null outside overlap windows, so an early
+    part of the day is all-null and Polars used to infer a Null column and error
+    on the first real value ("london_ny_overlap") later in the day.
+    """
+    day = dt.date(2026, 7, 7)
+    with db.session() as s:
+        m = Market(slug="btc-updown-5m-1783447200", price_to_beat=108000.0, fee_rate_bps=72.0)
+        s.add(m)
+        s.flush()
+        for i in range(120):
+            # first 119 rows have no overlap; the last introduces a string value
+            overlap = "london_ny_overlap" if i == 119 else None
+            s.add(Snapshot(
+                market_id=m.id, label=f"t_{i}", target_seconds_left=i,
+                captured_at=utc(2026, 7, 7, 12, 0, 0) + dt.timedelta(seconds=i),
+                dominant_side="UP", dominant_mid=0.6, up_mid=0.6, down_mid=0.4,
+                session_primary="new_york", session_overlap=overlap, session_integrity="regular",
+            ))
+        s.commit()
+
+    exp = ParquetExporter(db.session_factory, str(tmp_path))
+    manifest = exp.export_day(day)  # must not raise
+    assert manifest["row_counts"]["snapshots_features"] == 120
+    df = pl.read_parquet(str(tmp_path / "dt=2026-07-07" / "snapshots_features.parquet"))
+    assert df["session_overlap"].dtype == pl.String
+    assert df.filter(pl.col("session_overlap") == "london_ny_overlap").height == 1
+
+
 def test_duckdb_accuracy_by_label(db, tmp_path):
     _seed(db)
     ParquetExporter(db.session_factory, str(tmp_path)).export_day(dt.date(2026, 7, 7))

@@ -156,10 +156,23 @@ cleanup(){
 trap cleanup INT TERM EXIT
 
 analytics_loop(){
-  # Run the hourly analytics job every hour (daily/weekly would be systemd timers in prod).
+  # Run the hourly analytics job every hour (weekly walk-forward would be a
+  # systemd timer in prod).
   while true; do
     sleep 3600
     uv run python -m pmre analytics-hourly || true
+  done
+}
+
+daily_loop(){
+  # Once per day: refresh research-only candidates, regenerate the daily report,
+  # and export the previous day's Parquet partitions. Without this loop the
+  # hourly job alone never refreshes strategy_candidates or writes /data/parquet.
+  # (A systemd OnCalendar timer would drive this in a packaged deployment.)
+  sleep 300   # let collectors warm up before the first run
+  while true; do
+    uv run python -m pmre analytics-daily || true
+    sleep 86400
   done
 }
 
@@ -185,6 +198,7 @@ case "$MODE" in
     start rest uv run python -m pmre serve-rest
     start mcp  uv run python -m pmre serve-mcp
     start analytics bash -c "$(declare -f analytics_loop); analytics_loop"
+    start analytics-daily bash -c "$(declare -f daily_loop); daily_loop"
     ;;
   -h|--help|help)
     sed -n '2,20p' "$0"; exit 0

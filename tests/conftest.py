@@ -21,6 +21,18 @@ from pmre.config import Settings  # noqa: E402
 from pmre.db.engine import Database  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_env(monkeypatch):
+    """Keep tests independent of the operator's local ``./.env``.
+
+    On a deployed host ``.env`` carries real secrets and a Postgres URL; pydantic
+    would load it and mask the code defaults / fail-fast behaviour these tests
+    assert on. Neutralise the env-file for every test (explicit overrides and
+    real env vars still apply).
+    """
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
+
+
 @pytest.fixture
 def db(tmp_path) -> Database:
     url = f"sqlite+pysqlite:///{tmp_path/'pmre_test.db'}"
